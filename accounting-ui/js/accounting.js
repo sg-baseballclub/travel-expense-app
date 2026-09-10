@@ -1,7 +1,7 @@
 const APP_CONFIG = {
   // 既存旅費申請システムで使用しているGASの実行URLを設定してください
   // 例: https://script.google.com/macros/s/AKfycbxISn7y_PZR-VPSRbcL6qSnd11QtoaQD8losokcve_ix9m7IM9aRu5Ub5JDRJE4fNMi/exec
-  apiBaseUrl: 'https://script.google.com/macros/s/AKfycbx2Ig7BPUW8WEv1W-dhnyEsop4I7TLd2Gi0e8p7_EbRzSb9dJAdBbicCEMgrb9DmGA/exec'
+  apiBaseUrl: 'https://script.google.com/macros/s/AKfycbxISn7y_PZR-VPSRbcL6qSnd11QtoaQD8losokcve_ix9m7IM9aRu5Ub5JDRJE4fNMi/exec'
 };
 
 const storageKeys = {
@@ -4364,3 +4364,82 @@ async function generateSettlementPdf() {
     hideLoading();
   }
 }
+
+
+/* === startup hydration fix v20260910 === */
+function ensureFiscalYearOptionsReady_() {
+  try {
+    cacheEnhancedEls_();
+  } catch (error) {
+    console.warn(error);
+  }
+  const selects = typeof getManagedFiscalYearSelects_ === 'function' ? getManagedFiscalYearSelects_() : [];
+  const hasEmpty = selects.some(function(select) {
+    return select && (!select.options || select.options.length === 0);
+  });
+  if (hasEmpty || !selects.length) {
+    try {
+      populateFiscalYearOptions();
+    } catch (error) {
+      console.warn(error);
+    }
+  } else {
+    try {
+      applyFiscalYearUi_();
+    } catch (error) {
+      console.warn(error);
+    }
+  }
+}
+
+function ensureUserDisplayReady_() {
+  try {
+    cacheEnhancedEls_();
+  } catch (error) {
+    console.warn(error);
+  }
+  if (state.currentUser && els.currentUserName && !String(els.currentUserName.textContent || '').trim()) {
+    try {
+      updateCurrentUserDisplay();
+    } catch (error) {
+      console.warn(error);
+    }
+  }
+  if (els.currentUserName && state.currentUser) {
+    els.currentUserName.textContent = state.currentUser.name || '未選択';
+  }
+  if (els.userList && state.users && state.users.length) {
+    renderUserList(els.userList, state.users, (els.userSearchInput && els.userSearchInput.value) || '', selectUserAndEnter);
+  }
+  if (els.switchUserList && state.users && state.users.length) {
+    renderUserList(els.switchUserList, state.users, (els.switchUserSearchInput && els.switchUserSearchInput.value) || '', switchCurrentUser);
+  }
+}
+
+function scheduleStartupHydration_() {
+  const delays = [0, 150, 600];
+  delays.forEach(function(delay) {
+    window.setTimeout(function() {
+      ensureFiscalYearOptionsReady_();
+      ensureUserDisplayReady_();
+    }, delay);
+  });
+}
+
+const _initForStartupHydration_ = init;
+init = async function() {
+  await _initForStartupHydration_();
+  scheduleStartupHydration_();
+};
+
+const _loadUsersForStartupHydration_ = loadUsers;
+loadUsers = async function() {
+  const result = await _loadUsersForStartupHydration_();
+  ensureUserDisplayReady_();
+  ensureFiscalYearOptionsReady_();
+  return result;
+};
+
+window.addEventListener('load', function() {
+  scheduleStartupHydration_();
+});
