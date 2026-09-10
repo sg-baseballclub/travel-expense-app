@@ -1180,6 +1180,8 @@ function doGet(e) {
       case 'accounting/checkTravelTransferDuplicate': return outputJson_(checkTravelTransferDuplicate_(e.parameter || {}));
       case 'accounting/listBudgetRows': return outputJson_(listBudgetRows_(e.parameter || {}));
       case 'accounting/buildSettlementSummary': return outputJson_(buildSettlementSummary_(e.parameter || {}));
+      case 'accounting/getSettlementMeta': return outputJson_(getAccountingDocumentMeta_('settlement', e.parameter && e.parameter.fiscalYear));
+      case 'accounting/getBudgetMeta': return outputJson_(getAccountingDocumentMeta_('budget', e.parameter && e.parameter.fiscalYear));
       case 'accounting/exportExpenseCsv': return outputJson_(exportExpenseCsv_(e.parameter || {}));
       case 'accounting/exportIncomeCsv': return outputJson_(exportIncomeCsv_(e.parameter || {}));
       default: return outputJson_({ ok: false, error: 'unknown action' });
@@ -1216,6 +1218,9 @@ function doPost(e) {
       case 'accounting/createSubject': return outputJson_(createAccountingSubject_(payload));
       case 'accounting/updateSubject': return outputJson_(updateAccountingSubject_(payload));
       case 'accounting/deleteSubject': return outputJson_(deleteAccountingSubject_(payload));
+      case 'accounting/reorderSubjects': return outputJson_(reorderAccountingSubjects_(payload));
+      case 'accounting/saveSettlementMeta': return outputJson_(saveAccountingDocumentMeta_('settlement', payload));
+      case 'accounting/saveBudgetMeta': return outputJson_(saveAccountingDocumentMeta_('budget', payload));
 
       case 'accounting/createExpenseVoucher': return outputJson_(createExpenseVoucher_(payload));
       case 'accounting/updateExpenseVoucher': return outputJson_(updateExpenseVoucher_(payload));
@@ -4078,5 +4083,280 @@ function exportSettlementSheet_(payload) {
     incomeTotal: data.incomeTotal,
     expenseTotal: data.expenseTotal,
     balance: data.balance
+  };
+}
+
+
+/*********************************
+ * 科目並び替え・帳票記載情報保存強化 v20260910b
+ *********************************/
+function upsertAccountingConfigValue_(key, value, note) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(ACCOUNTING_CONFIG_SHEET_NAME);
+  const row = findRowByColumnValue_(sheet, 1, key, 2);
+  const values = [[trim_(key), value == null ? '' : String(value), trim_(note)]];
+  if (row >= 0) {
+    sheet.getRange(row, 1, 1, 3).setValues(values);
+  } else {
+    const newRow = findFirstEmptyRowByColumn_(sheet, 1, 2);
+    sheet.getRange(newRow, 1, 1, 3).setValues(values);
+  }
+}
+
+function getAccountingDocumentConfigKey_(documentType, fiscalYear) {
+  return ['ACCOUNTING_DOC_META', trim_(documentType), String(Number(fiscalYear) || 0)].join('_');
+}
+
+function getDefaultSettlementMetaPayload_() {
+  return {
+    meta: {
+      reportDate: '',
+      auditDate: '',
+      directorName: '',
+      accountantName: '',
+      auditorName: ''
+    },
+    notes: {}
+  };
+}
+
+function getDefaultBudgetMetaPayload_() {
+  return {
+    meta: {
+      reportDate: '',
+      directorName: '',
+      accountantName: ''
+    }
+  };
+}
+
+function getAccountingDocumentMeta_(documentType, fiscalYear) {
+  const year = Number(fiscalYear);
+  if (!year) throw new Error('年度が必要です');
+  const key = getAccountingDocumentConfigKey_(documentType, year);
+  const raw = getAccountingConfigValue_(key);
+  const base = documentType === 'settlement' ? getDefaultSettlementMetaPayload_() : getDefaultBudgetMetaPayload_();
+  if (!raw) {
+    return Object.assign({ ok: true, fiscalYear: year }, JSON.parse(JSON.stringify(base)));
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (documentType === 'settlement') {
+      return {
+        ok: true,
+        fiscalYear: year,
+        meta: Object.assign({}, base.meta, parsed.meta || {}),
+        notes: parsed.notes && typeof parsed.notes === 'object' ? parsed.notes : {}
+      };
+    }
+    return {
+      ok: true,
+      fiscalYear: year,
+      meta: Object.assign({}, base.meta, parsed.meta || {})
+    };
+  } catch (error) {
+    return Object.assign({ ok: true, fiscalYear: year }, JSON.parse(JSON.stringify(base)));
+  }
+}
+
+function saveAccountingDocumentMeta_(documentType, payload) {
+  validateCurrentUser_(payload.currentUser);
+  const year = Number(payload.fiscalYear);
+  if (!year) throw new Error('年度が必要です');
+  const base = documentType === 'settlement' ? getDefaultSettlementMetaPayload_() : getDefaultBudgetMetaPayload_();
+  const data = {
+    meta: Object.assign({}, base.meta, payload.meta || {})
+  };
+  if (documentType === 'settlement') {
+    data.notes = payload.notes && typeof payload.notes === 'object' ? payload.notes : {};
+  }
+  upsertAccountingConfigValue_(
+    getAccountingDocumentConfigKey_(documentType, year),
+    JSON.stringify(data),
+    documentType === 'settlement' ? '決算書記載情報（年度別）' : '予算書記載情報（年度別）'
+  );
+  return Object.assign({ ok: true, fiscalYear: year }, data);
+}
+
+function reorderAccountingSubjects_(payload) {
+  validateCurrentUser_(payload.currentUser);
+  const fiscalYear = Number(payload.fiscalYear);
+  if (!fiscalYear) throw new Error('年度が必要です');
+  const rows = payload.rows || [];
+  rows.forEach(function(item, index) {
+    const code = trim_(item.subjectCode);
+    if (!code) return;
+    upsertAccountingSubjectYearSetting_(fiscalYear, code, {
+      sortOrder: Number(index + 1),
+      enabled: item.enabled !== false,
+      note: trim_(item.note)
+    });
+  });
+  return { ok: true, fiscalYear: fiscalYear, count: rows.length };
+}
+
+function buildBudgetOfficerDisplayName_(value) {
+  const name = trim_(value);
+  return name || '〇〇　〇〇';
+}
+
+function buildBudgetPdfData_(fiscalYear, options) {
+  const subjectMap = getBudgetSubjectMetaMap_(fiscalYear);
+  const budgetRows = listBudgetRows_({ fiscalYear: String(fiscalYear) }).rows || [];
+  var rows = [];
+  if (budgetRows.length) {
+    rows = budgetRows.map(function(row) {
+      const key = [trim_(row['収支区分']), trim_(row['科目コード'])].join('|');
+      const meta = subjectMap[key] || {};
+      const budgetAmount = toNumber_(row['当初予算額']) + toNumber_(row['補正予算額']) || toNumber_(row['予算合計額']);
+      return {
+        type: trim_(row['収支区分']),
+        subjectCode: trim_(row['科目コード']),
+        subjectName: trim_(row['科目名']) || meta.subjectName || '',
+        budgetAmount: budgetAmount,
+        note: trim_(row['備考']) || meta.note || '',
+        sortOrder: typeof meta.sortOrder === 'number' ? meta.sortOrder : 0,
+        enabled: meta.enabled !== false
+      };
+    }).filter(function(row) {
+      return row.enabled;
+    });
+  } else {
+    rows = Object.keys(subjectMap).map(function(key) {
+      const parts = key.split('|');
+      const meta = subjectMap[key];
+      return {
+        type: parts[0] || '',
+        subjectCode: parts[1] || '',
+        subjectName: meta.subjectName || '',
+        budgetAmount: 0,
+        note: meta.note || '',
+        sortOrder: meta.sortOrder || 0,
+        enabled: meta.enabled !== false
+      };
+    }).filter(function(row) { return row.enabled; });
+  }
+
+  rows.sort(function(a, b) {
+    const typeOrder = { '収入': 0, '支出': 1 };
+    const aType = Object.prototype.hasOwnProperty.call(typeOrder, a.type) ? typeOrder[a.type] : 9;
+    const bType = Object.prototype.hasOwnProperty.call(typeOrder, b.type) ? typeOrder[b.type] : 9;
+    if (aType !== bType) return aType - bType;
+    const aSort = Number(a.sortOrder || 0);
+    const bSort = Number(b.sortOrder || 0);
+    if (aSort !== bSort) return aSort - bSort;
+    return String(a.subjectCode || '').localeCompare(String(b.subjectCode || ''), 'ja');
+  });
+
+  const incomeRows = rows.filter(function(row) { return row.type === '収入'; });
+  const expenseRows = rows.filter(function(row) { return row.type === '支出'; });
+  const incomeTotal = incomeRows.reduce(function(sum, row) { return sum + toNumber_(row.budgetAmount); }, 0);
+  const expenseTotal = expenseRows.reduce(function(sum, row) { return sum + toNumber_(row.budgetAmount); }, 0);
+  const saved = getAccountingDocumentMeta_('budget', fiscalYear);
+  const metaInput = options && options.budgetMeta ? options.budgetMeta : {};
+  const meta = Object.assign({}, saved.meta || {}, metaInput || {});
+  return {
+    fiscalYear: Number(fiscalYear),
+    title: toJapaneseEraYearLabel_(fiscalYear) + ' 宍粟市野球部　一般会計予算書（案）',
+    incomeRows: incomeRows,
+    expenseRows: expenseRows,
+    incomeTotal: incomeTotal,
+    expenseTotal: expenseTotal,
+    balance: incomeTotal - expenseTotal,
+    outputDate: formatJapaneseEraDate_(new Date()),
+    reportDate: formatJapaneseEraDate_(meta.reportDate),
+    directorName: buildBudgetOfficerDisplayName_(meta.directorName),
+    accountantName: buildBudgetOfficerDisplayName_(meta.accountantName)
+  };
+}
+
+function writeBudgetPdfSheet_(sheet, data) {
+  ensureSheetSize_(sheet, 140, 10);
+  sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).breakApart();
+  sheet.clear();
+  sheet.clearFormats();
+  sheet.clearConditionalFormatRules();
+  sheet.setHiddenGridlines(true);
+
+  const widths = [52, 52, 92, 72, 72, 92, 92, 92, 92, 92];
+  widths.forEach(function(width, index) {
+    sheet.setColumnWidth(index + 1, width);
+  });
+
+  sheet.getRange(2, 1, 1, 10).merge();
+  sheet.getRange(2, 1)
+    .setValue(data.title)
+    .setFontSize(14)
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle');
+  sheet.setRowHeight(2, 30);
+
+  var lastIncomeRow = applyBudgetTableSection_(sheet, 4, '【収入の部】', data.incomeRows, data.incomeTotal);
+  var expenseStartRow = lastIncomeRow + 2;
+  var lastExpenseRow = applyBudgetTableSection_(sheet, expenseStartRow, '【支出の部】', data.expenseRows, data.expenseTotal);
+
+  var summaryStartRow = lastExpenseRow + 2;
+  var labels = ['収　入　額', '支　出　額', '差　引　額'];
+  var values = [data.incomeTotal, data.expenseTotal, data.balance];
+  for (var i = 0; i < labels.length; i++) {
+    var row = summaryStartRow + i;
+    sheet.getRange(row, 2, 1, 2).merge();
+    sheet.getRange(row, 4, 1, 2).merge();
+    sheet.getRange(row, 2).setValue(labels[i]).setFontWeight('bold').setHorizontalAlignment('center');
+    sheet.getRange(row, 4).setValue(values[i]).setNumberFormat('#,##0"円"').setHorizontalAlignment('right');
+    sheet.getRange(row, 2, 1, 4).setVerticalAlignment('middle');
+    sheet.setRowHeight(row, 24);
+  }
+  sheet.getRange(summaryStartRow + 2, 1, 1, 6).setBorder(false, false, true, false, false, false, '#000000', SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+
+  var footerRow = summaryStartRow + 5;
+  sheet.getRange(footerRow, 1, 1, 6).merge();
+  sheet.getRange(footerRow, 1).setValue('宍粟市野球部一般会計予算を上記のとおり提案します。').setHorizontalAlignment('left');
+  sheet.getRange(footerRow + 1, 6, 1, 5).merge();
+  sheet.getRange(footerRow + 1, 6).setValue(data.reportDate || '令和　年　月　日').setHorizontalAlignment('center');
+
+  sheet.getRange(footerRow + 2, 6, 1, 2).merge();
+  sheet.getRange(footerRow + 2, 6).setValue('監　督').setHorizontalAlignment('center');
+  sheet.getRange(footerRow + 2, 8, 1, 3).merge();
+  sheet.getRange(footerRow + 2, 8).setValue('　' + data.directorName).setHorizontalAlignment('left');
+
+  sheet.getRange(footerRow + 3, 6, 1, 2).merge();
+  sheet.getRange(footerRow + 3, 6).setValue('会　計').setHorizontalAlignment('center');
+  sheet.getRange(footerRow + 3, 8, 1, 3).merge();
+  sheet.getRange(footerRow + 3, 8).setValue('　' + data.accountantName).setHorizontalAlignment('left');
+}
+
+function generateBudgetPdf_(payload) {
+  validateCurrentUser_(payload.currentUser);
+  const fiscalYear = Number(payload.fiscalYear);
+  if (!fiscalYear) throw new Error('年度が必要です');
+  if (payload.budgetMeta) {
+    saveAccountingDocumentMeta_('budget', {
+      currentUser: payload.currentUser,
+      fiscalYear: fiscalYear,
+      meta: payload.budgetMeta
+    });
+  }
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(ACCOUNTING_BUDGET_OUTPUT_SHEET_NAME);
+  const data = buildBudgetPdfData_(fiscalYear, { budgetMeta: payload.budgetMeta || {} });
+  writeBudgetPdfSheet_(sheet, data);
+  SpreadsheetApp.flush();
+  const exportUrl = 'https://docs.google.com/spreadsheets/d/' + ss.getId() + '/export?format=pdf&gid=' + sheet.getSheetId() + '&portrait=true&size=A4&fitw=true&sheetnames=false&printtitle=false&pagenumbers=false&gridlines=false&fzr=false';
+  const token = ScriptApp.getOAuthToken();
+  const response = UrlFetchApp.fetch(exportUrl, {
+    headers: { Authorization: 'Bearer ' + token },
+    muteHttpExceptions: true
+  });
+  if (response.getResponseCode() >= 400) throw new Error('予算書PDFの出力に失敗しました');
+  const blob = response.getBlob().setName('一般会計予算書_' + fiscalYear + '年度_' + Utilities.formatDate(new Date(), APP_TIMEZONE, 'yyyyMMdd_HHmmss') + '.pdf');
+  return {
+    ok: true,
+    fiscalYear: fiscalYear,
+    fileName: blob.getName(),
+    mimeType: 'application/pdf',
+    pdfBase64: Utilities.base64Encode(blob.getBytes()),
+    createdAt: nowString_()
   };
 }
