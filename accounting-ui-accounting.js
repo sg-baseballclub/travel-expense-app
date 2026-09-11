@@ -1,6 +1,6 @@
 const APP_CONFIG = {
   // 既存旅費申請システムで使用しているGASの実行URLを設定してください
-  // 例: https://script.google.com/macros/s/AKfycbzkJgYnEm1B0cHq3KciciQnPlPVvdhjGcAWyaaSwy0hPKyfNGaEwcE6QCF8XKIe4GiM/exec
+  // 例: https://script.google.com/macros/s/AKfycbxfrzG06V2E8D3KyPUvGgVpb0HT98WMCrTDsvEkteAD0FfNNwGB0ldQBQSKaHwo9i3-/exec
   apiBaseUrl: 'https://script.google.com/macros/s/AKfycbxfrzG06V2E8D3KyPUvGgVpb0HT98WMCrTDsvEkteAD0FfNNwGB0ldQBQSKaHwo9i3-/exec'
 };
 
